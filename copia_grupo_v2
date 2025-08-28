@@ -1,0 +1,210 @@
+from telethon import TelegramClient, events
+from telethon.errors import FloodWaitError, RpcError
+import asyncio, os, time, csv
+from datetime import datetime
+import smtplib
+from email.mime.text import MIMEText
+
+# ----------------------------
+# CONFIGURAÇÕES DO TELEGRAM
+# ----------------------------
+api_id = 24551106
+api_hash = '838d425f82e1912c924a0c0c657cf4f3'
+phone = '+5562985161187'
+senha_2fa = 'batista16'
+
+# IDs dos grupos
+source_group = -1001712910340  # grupo de origem
+target_group = -4697344911     # grupo de destino
+# ----------------------------
+# CONFIGURAÇÕES DE ENVIO
+# ----------------------------
+BACKUP_DIR = 'backup_midias'
+FILA_FILE = 'fila_midia.csv'
+LOG_FILE = 'log_midia.csv'
+BATCH_SIZE = 20
+INITIAL_DELAY_BETWEEN_MEDIA = 5   # segundos
+DELAY_BETWEEN_BATCHES = 60        # segundos
+
+# ----------------------------
+# CONFIGURAÇÃO DE E-MAIL
+# ----------------------------
+EMAIL_FROM = 'seuemail@gmail.com'
+EMAIL_TO = 'seuemail@gmail.com'
+EMAIL_PASSWORD = 'SENHA_DO_EMAIL'
+SMTP_SERVER = 'smtp.gmail.com'
+SMTP_PORT = 587
+
+# ----------------------------
+# CRIA PASTAS E ARQUIVOS
+# ----------------------------
+os.makedirs(BACKUP_DIR, exist_ok=True)
+if not os.path.exists(FILA_FILE):
+    with open(FILA_FILE, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow(['id_midia','caminho','status'])
+if not os.path.exists(LOG_FILE):
+    with open(LOG_FILE, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow(['id_midia','timestamp','status'])
+
+# ----------------------------
+# FUNÇÕES DE E-MAIL
+# ----------------------------
+def enviar_email_assunto(msg_erro):
+    try:
+        msg = MIMEText(msg_erro)
+        msg['Subject'] = 'Erro no Bot de Telegram'
+        msg['From'] = EMAIL_FROM
+        msg['To'] = EMAIL_TO
+
+        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
+        server.starttls()
+        server.login(EMAIL_FROM, EMAIL_PASSWORD)
+        server.sendmail(EMAIL_FROM, EMAIL_TO, msg.as_string())
+        server.quit()
+        print("📧 E-mail de erro enviado com sucesso!")
+    except Exception as e:
+        print(f"❌ Falha ao enviar e-mail: {e}")
+
+# ----------------------------
+# FUNÇÕES DE FILA PERSISTENTE
+# ----------------------------
+def adicionar_na_fila(id_midia, caminho):
+    with open(FILA_FILE, 'a', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow([id_midia, caminho, 'pendente'])
+
+def carregar_lote(batch_size):
+    lote = []
+    linhas = []
+    with open(FILA_FILE, 'r', newline='', encoding='utf-8') as f:
+        reader = csv.reader(f)
+        for row in reader:
+            if row[2] == 'pendente' and len(lote) < batch_size:
+                lote.append((row[0], row[1]))
+            linhas.append(row)
+    return lote, linhas
+
+def atualizar_status(id_midia):
+    linhas = []
+    with open(FILA_FILE, 'r', newline='', encoding='utf-8') as f:
+        reader = csv.reader(f)
+        for row in reader:
+            if row[0] == str(id_midia):
+                row[2] = 'enviado'
+            linhas.append(row)
+    with open(FILA_FILE, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerows(linhas)
+
+def registrar_log(midia_id, status):
+    with open(LOG_FILE, 'a', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow([midia_id, datetime.now().strftime('%Y-%m-%d %H:%M:%S'), status])
+
+# ----------------------------
+# FUNÇÃO PARA SALVAR MÍDIA LOCAL
+# ----------------------------
+async def salvar_midia_local(message):
+    filename = f"{BACKUP_DIR}/{message.id}_{int(time.time())}"
+    try:
+        await message.download_media(file=filename)
+        return filename
+    except Exception as e:
+        print(f"❌ Falha ao salvar mídia {message.id}: {e}")
+        return None
+
+# ----------------------------
+# FUNÇÃO PARA ENVIAR MÍDIA COM DELAY ADAPTATIVO
+# ----------------------------
+async def enviar_midia(client, midia, midia_id, delay_media):
+    while True:
+        try:
+            await client.send_file(target_group, midia)
+            print(f"✔ Mídia {midia_id} enviada")
+            atualizar_status(midia_id)
+            registrar_log(midia_id, 'enviado')
+            break
+        except FloodWaitError as e:
+            print(f"⚠️ FloodWait {e.seconds}s para mídia {midia_id}")
+            registrar_log(midia_id, f'floodwait {e.seconds}s')
+            await asyncio.sleep(e.seconds + 1)
+            delay_media = max(delay_media, e.seconds + 1)
+        except RpcError as e:
+            print(f"❌ RpcError mídia {midia_id}: {e}, tentando em 10s")
+            registrar_log(midia_id, f'rpc_error')
+            await asyncio.sleep(10)
+        except Exception as e:
+            print(f"❌ Erro inesperado mídia {midia_id}: {e}, esperando 30s...")
+            registrar_log(midia_id, f'erro: {e}')
+            enviar_email_assunto(f"Erro inesperado mídia {midia_id}: {e}")
+            await asyncio.sleep(30)
+    return delay_media
+
+# ----------------------------
+# ENVIO DO HISTÓRICO EM LOTES
+# ----------------------------
+async def enviar_historico(client):
+    delay_media = INITIAL_DELAY_BETWEEN_MEDIA
+
+    # Carrega histórico do Telegram e adiciona na fila persistente
+    async for message in client.iter_messages(source_group, reverse=True):
+        if message.media:
+            adicionar_na_fila(message.id, '')
+
+    while True:
+        lote, _ = carregar_lote(BATCH_SIZE)
+        if not lote:
+            break
+        print(f"Enviando lote de {len(lote)} mídias")
+        for midia_id, _ in lote:
+            try:
+                message = await client.get_messages(source_group, ids=int(midia_id))
+                arquivo_local = await salvar_midia_local(message)
+                if arquivo_local:
+                    delay_media = await enviar_midia(client, arquivo_local, midia_id, delay_media)
+                    await asyncio.sleep(delay_media)
+            except Exception as e:
+                print(f"❌ Erro crítico lote: {e}")
+        print(f"✅ Lote enviado, aguardando {DELAY_BETWEEN_BATCHES}s...")
+        await asyncio.sleep(DELAY_BETWEEN_BATCHES)
+
+# ----------------------------
+# LISTENER DE NOVAS MÍDIAS
+# ----------------------------
+async def listener_novas_midias(client):
+    @client.on(events.NewMessage(chats=source_group))
+    async def handler(event):
+        if event.message.media:
+            arquivo_local = await salvar_midia_local(event.message)
+            if arquivo_local:
+                await enviar_midia(client, arquivo_local, event.message.id, INITIAL_DELAY_BETWEEN_MEDIA)
+
+# ----------------------------
+# MAIN
+# ----------------------------
+async def main():
+    while True:
+        try:
+            await client.start(phone=phone, password=senha_2fa)
+            print("✔ Autenticado com sucesso!")
+
+            await enviar_historico(client)
+            await listener_novas_midias(client)
+
+            print("⏳ Escutando novas mídias em tempo real...")
+            await client.run_until_disconnected()
+
+        except Exception as e:
+            msg = f"❌ Erro crítico: {e}, reconectando em 15s..."
+            print(msg)
+            enviar_email_assunto(msg)
+            await asyncio.sleep(15)
+
+# ----------------------------
+# EXECUÇÃO
+# ----------------------------
+if __name__ == "__main__":
+    with TelegramClient('forward_session', api_id, api_hash) as client:
+        client.loop.run_until_complete(main())
